@@ -7,6 +7,7 @@ DB-backed workflows (template sync, lead-agent record creation) live in
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
@@ -63,6 +64,9 @@ class ProvisionOptions:
     force_bootstrap: bool = False
     overwrite: bool = False
 
+
+_UPSERT_UPDATE_MAX_RETRIES = 3
+_UPSERT_UPDATE_RETRY_DELAY_S = 0.5
 
 _ROLE_SOUL_MAX_CHARS = 24_000
 _ROLE_SOUL_WORD_RE = re.compile(r"[a-z0-9]+")
@@ -569,15 +573,25 @@ class OpenClawGatewayControlPlane(GatewayControlPlane):
                 marker in message for marker in ("already", "exist", "duplicate", "conflict")
             ):
                 raise
-        await openclaw_call(
-            "agents.update",
-            {
-                "agentId": registration.agent_id,
-                "name": registration.name,
-                "workspace": registration.workspace_path,
-            },
-            config=self._config,
-        )
+
+        # The gateway may not have fully registered the agent yet after a
+        # successful create call.  Retry with backoff when the update returns
+        # "not found" right after creation.
+        update_params = {
+            "agentId": registration.agent_id,
+            "name": registration.name,
+            "workspace": registration.workspace_path,
+        }
+        for attempt in range(_UPSERT_UPDATE_MAX_RETRIES):
+            try:
+                await openclaw_call("agents.update", update_params, config=self._config)
+                break
+            except OpenClawGatewayError as exc:
+                if not _is_missing_agent_error(exc):
+                    raise
+                if attempt == _UPSERT_UPDATE_MAX_RETRIES - 1:
+                    raise
+                await asyncio.sleep(_UPSERT_UPDATE_RETRY_DELAY_S * (attempt + 1))
         await self.patch_agent_heartbeats(
             [(registration.agent_id, registration.workspace_path, registration.heartbeat)],
         )
