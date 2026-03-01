@@ -175,6 +175,7 @@ async def test_provision_main_agent_uses_dedicated_openclaw_agent_id(monkeypatch
         "_set_agent_files",
         _fake_set_agent_files,
     )
+    monkeypatch.setattr(agent_provisioning.settings, "base_url", "https://api.example.com")
 
     await agent_provisioning.OpenClawGatewayProvisioner().apply_agent_lifecycle(
         agent=agent,  # type: ignore[arg-type]
@@ -605,6 +606,19 @@ async def test_control_plane_upsert_agent_raises_after_max_retries(monkeypatch):
                 heartbeat={"every": "10m", "target": "last", "includeReasoning": False},
             ),
         )
+
+
+def test_require_base_url_raises_when_not_configured(monkeypatch):
+    """Provisioning must fail loudly when BASE_URL is not set, instead of
+    silently embedding the REPLACE_WITH_BASE_URL placeholder."""
+    monkeypatch.setattr(agent_provisioning.settings, "base_url", "")
+    with pytest.raises(ValueError, match="BASE_URL is not configured"):
+        agent_provisioning._require_base_url()
+
+
+def test_require_base_url_returns_value_when_configured(monkeypatch):
+    monkeypatch.setattr(agent_provisioning.settings, "base_url", "https://api.example.com")
+    assert agent_provisioning._require_base_url() == "https://api.example.com"
 
 
 def test_is_missing_agent_error_matches_gateway_agent_not_found() -> None:
