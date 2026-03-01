@@ -808,6 +808,7 @@ main() {
   upsert_env_value "$REPO_ROOT/.env" "LOCAL_AUTH_TOKEN" "$local_auth_token"
   upsert_env_value "$REPO_ROOT/.env" "NEXT_PUBLIC_API_URL" "$next_public_api_url"
   upsert_env_value "$REPO_ROOT/.env" "CORS_ORIGINS" "http://$public_host:$frontend_port"
+  upsert_env_value "$REPO_ROOT/.env" "BASE_URL" "http://$public_host:$backend_port"
 
   if [[ "$deployment_mode" == "docker" ]]; then
     ensure_file_from_example "$REPO_ROOT/backend/.env" "$REPO_ROOT/backend/.env.example"
