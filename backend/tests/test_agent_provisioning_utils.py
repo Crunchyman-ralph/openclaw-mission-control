@@ -175,6 +175,7 @@ async def test_provision_main_agent_uses_dedicated_openclaw_agent_id(monkeypatch
         "_set_agent_files",
         _fake_set_agent_files,
     )
+    monkeypatch.setattr(agent_provisioning.settings, "base_url", "https://api.example.com")
 
     await agent_provisioning.OpenClawGatewayProvisioner().apply_agent_lifecycle(
         agent=agent,  # type: ignore[arg-type]
@@ -528,6 +529,96 @@ async def test_control_plane_upsert_agent_handles_already_exists(monkeypatch):
 
     assert calls[0][0] == "agents.create"
     assert calls[1][0] == "agents.update"
+
+
+@pytest.mark.asyncio
+async def test_control_plane_upsert_agent_retries_update_on_not_found(monkeypatch):
+    """agents.update should be retried when the gateway returns 'not found'
+    right after a successful agents.create (race between create and update)."""
+
+    calls: list[tuple[str, dict[str, object] | None]] = []
+    update_attempt = 0
+
+    async def _fake_openclaw_call(method, params=None, config=None):
+        _ = config
+        calls.append((method, params))
+        nonlocal update_attempt
+        if method == "agents.create":
+            return {"ok": True}
+        if method == "agents.update":
+            update_attempt += 1
+            if update_attempt < 3:
+                raise agent_provisioning.OpenClawGatewayError(
+                    'agent "board-agent-a" not found',
+                )
+            return {"ok": True}
+        if method == "config.get":
+            return {"hash": None, "config": {"agents": {"list": []}}}
+        if method == "config.patch":
+            return {"ok": True}
+        raise AssertionError(f"Unexpected method: {method}")
+
+    monkeypatch.setattr(agent_provisioning, "openclaw_call", _fake_openclaw_call)
+    monkeypatch.setattr(agent_provisioning, "_UPSERT_UPDATE_RETRY_DELAY_S", 0)
+    cp = agent_provisioning.OpenClawGatewayControlPlane(
+        agent_provisioning.GatewayClientConfig(url="ws://gateway.example/ws", token=None),
+    )
+    await cp.upsert_agent(
+        agent_provisioning.GatewayAgentRegistration(
+            agent_id="board-agent-a",
+            name="Board Agent A",
+            workspace_path="/tmp/workspace-board-agent-a",
+            heartbeat={"every": "10m", "target": "last", "includeReasoning": False},
+        ),
+    )
+
+    assert calls[0][0] == "agents.create"
+    update_calls = [c for c in calls if c[0] == "agents.update"]
+    assert len(update_calls) == 3
+    assert update_attempt == 3
+
+
+@pytest.mark.asyncio
+async def test_control_plane_upsert_agent_raises_after_max_retries(monkeypatch):
+    """agents.update should raise after exhausting all retries."""
+
+    async def _fake_openclaw_call(method, params=None, config=None):
+        _ = config
+        if method == "agents.create":
+            return {"ok": True}
+        if method == "agents.update":
+            raise agent_provisioning.OpenClawGatewayError(
+                'agent "board-agent-a" not found',
+            )
+        raise AssertionError(f"Unexpected method: {method}")
+
+    monkeypatch.setattr(agent_provisioning, "openclaw_call", _fake_openclaw_call)
+    monkeypatch.setattr(agent_provisioning, "_UPSERT_UPDATE_RETRY_DELAY_S", 0)
+    cp = agent_provisioning.OpenClawGatewayControlPlane(
+        agent_provisioning.GatewayClientConfig(url="ws://gateway.example/ws", token=None),
+    )
+    with pytest.raises(agent_provisioning.OpenClawGatewayError, match="not found"):
+        await cp.upsert_agent(
+            agent_provisioning.GatewayAgentRegistration(
+                agent_id="board-agent-a",
+                name="Board Agent A",
+                workspace_path="/tmp/workspace-board-agent-a",
+                heartbeat={"every": "10m", "target": "last", "includeReasoning": False},
+            ),
+        )
+
+
+def test_require_base_url_raises_when_not_configured(monkeypatch):
+    """Provisioning must fail loudly when BASE_URL is not set, instead of
+    silently embedding the REPLACE_WITH_BASE_URL placeholder."""
+    monkeypatch.setattr(agent_provisioning.settings, "base_url", "")
+    with pytest.raises(ValueError, match="BASE_URL is not configured"):
+        agent_provisioning._require_base_url()
+
+
+def test_require_base_url_returns_value_when_configured(monkeypatch):
+    monkeypatch.setattr(agent_provisioning.settings, "base_url", "https://api.example.com")
+    assert agent_provisioning._require_base_url() == "https://api.example.com"
 
 
 def test_is_missing_agent_error_matches_gateway_agent_not_found() -> None:

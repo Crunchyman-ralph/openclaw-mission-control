@@ -7,6 +7,7 @@ DB-backed workflows (template sync, lead-agent record creation) live in
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
@@ -63,6 +64,9 @@ class ProvisionOptions:
     force_bootstrap: bool = False
     overwrite: bool = False
 
+
+_UPSERT_UPDATE_MAX_RETRIES = 3
+_UPSERT_UPDATE_RETRY_DELAY_S = 0.5
 
 _ROLE_SOUL_MAX_CHARS = 24_000
 _ROLE_SOUL_WORD_RE = re.compile(r"[a-z0-9]+")
@@ -333,6 +337,19 @@ async def _resolve_role_soul_markdown(role: str) -> tuple[str, str]:
         return "", ""
 
 
+def _require_base_url() -> str:
+    """Return the configured BASE_URL or raise so provisioning never silently
+    embeds a placeholder that agents cannot use."""
+    url = settings.base_url
+    if not url:
+        raise ValueError(
+            "BASE_URL is not configured. "
+            "Set the BASE_URL environment variable (e.g. https://api-mission.example.com) "
+            "before provisioning agents."
+        )
+    return url
+
+
 def _build_context(
     agent: Agent,
     board: Board,
@@ -347,7 +364,7 @@ def _build_context(
     workspace_root = gateway.workspace_root
     workspace_path = _workspace_path(agent, workspace_root)
     session_key = agent.openclaw_session_id or ""
-    base_url = settings.base_url or "REPLACE_WITH_BASE_URL"
+    base_url = _require_base_url()
     main_session_key = GatewayAgentIdentity.session_key(gateway)
     identity_context = _identity_context(agent)
     user_context = _user_context(user)
@@ -388,7 +405,7 @@ def _build_main_context(
     auth_token: str,
     user: User | None,
 ) -> dict[str, str]:
-    base_url = settings.base_url or "REPLACE_WITH_BASE_URL"
+    base_url = _require_base_url()
     identity_context = _identity_context(agent)
     user_context = _user_context(user)
     return {
@@ -569,15 +586,25 @@ class OpenClawGatewayControlPlane(GatewayControlPlane):
                 marker in message for marker in ("already", "exist", "duplicate", "conflict")
             ):
                 raise
-        await openclaw_call(
-            "agents.update",
-            {
-                "agentId": registration.agent_id,
-                "name": registration.name,
-                "workspace": registration.workspace_path,
-            },
-            config=self._config,
-        )
+
+        # The gateway may not have fully registered the agent yet after a
+        # successful create call.  Retry with backoff when the update returns
+        # "not found" right after creation.
+        update_params = {
+            "agentId": registration.agent_id,
+            "name": registration.name,
+            "workspace": registration.workspace_path,
+        }
+        for attempt in range(_UPSERT_UPDATE_MAX_RETRIES):
+            try:
+                await openclaw_call("agents.update", update_params, config=self._config)
+                break
+            except OpenClawGatewayError as exc:
+                if not _is_missing_agent_error(exc):
+                    raise
+                if attempt == _UPSERT_UPDATE_MAX_RETRIES - 1:
+                    raise
+                await asyncio.sleep(_UPSERT_UPDATE_RETRY_DELAY_S * (attempt + 1))
         await self.patch_agent_heartbeats(
             [(registration.agent_id, registration.workspace_path, registration.heartbeat)],
         )
